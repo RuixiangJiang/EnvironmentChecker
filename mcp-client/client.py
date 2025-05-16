@@ -114,16 +114,15 @@ class MCPClient:
 
             if response.tool_calls:
                 for tool_call in response.tool_calls:
-                    print(f"tool_call = {tool_call}")
                     tool_name = tool_call["name"]
                     tool_args = tool_call["args"]
+                    tool_id = tool_call["id"]
 
                     # Log tool use
                     final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
 
                     # Run tool and capture result
                     result = await self.session.call_tool(tool_name, tool_args)
-                    print(f"call tool result = {result}")
                     tool_results.append({"call": tool_name, "result": result})
 
                     # Append assistant's tool call + tool result to messages
@@ -132,8 +131,7 @@ class MCPClient:
                         "content": "",  # GPT tool call messages don't contain visible text
                     })
                     messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
+                        "role": "user",
                         "content": str(result.content)
                     })
 
@@ -141,7 +139,6 @@ class MCPClient:
                 continue
 
             # If no more tool calls, end conversation
-            print(f"response.content = {response.content}")
             final_text.append(response.content)
             break
 
