@@ -8,7 +8,10 @@ from mcp.client.stdio import stdio_client
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from typing import List, Dict, Any
+import json
 
 load_dotenv()  # load environment variables from .env
 
@@ -18,7 +21,11 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.anthropic = Anthropic()
-        self.openai = OpenAI()
+        self.llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0.0,
+            timeout=60
+        )
     # methods will go here
 
     async def connect_to_server(self, server_script_path: str):
@@ -51,8 +58,13 @@ class MCPClient:
         print("\nConnected to server with tools:", [tool.name for tool in tools])
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
+        """Process a query using GPT-4 and available tools"""
+
         messages = [
+            {
+                "role": "system",
+                "content": "You are a coding assistant that talks like a pirate."
+            },
             {
                 "role": "user",
                 "content": query
@@ -60,63 +72,81 @@ class MCPClient:
         ]
 
         response = await self.session.list_tools()
-        available_tools = [{
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
-        } for tool in response.tools]
+        available_tools = []
+        for tool in response.tools:
+            available_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema
+                }
+            })
 
-        response = self.anthropic.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1000,
-            messages=messages,
-            tools=available_tools
-        )
-        print(f"response = {response}")
-
-        # Process response and handle tool calls
         final_text = []
+        tool_results = []
 
-        assistant_message_content = []
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-                assistant_message_content.append(content)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
+        # Helper to convert message list to LangChain format
+        def to_langchain_messages(msgs: List[Dict[str, Any]]):
+            result = []
+            for msg in msgs:
+                role = msg["role"]
+                content = msg["content"]
+                if role == "system":
+                    result.append(SystemMessage(content=content))
+                elif role == "user":
+                    result.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    result.append(AIMessage(content=content))
+                elif role == "tool":
+                    result.append(ToolMessage(tool_call_id=msg["tool_call_id"], content=content))
+            return result
 
-                # Execute tool call
-                result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+        while True:
+            lc_messages = to_langchain_messages(messages)
 
-                assistant_message_content.append(content)
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_message_content
-                })
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": content.id,
-                            "content": result.content
-                        }
-                    ]
-                })
+            # First GPT response
+            response = self.llm.invoke(
+                input=lc_messages,
+                tools=available_tools,
+                tool_choice="auto"
+            )
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1000,
-                    messages=messages,
-                    tools=available_tools
-                )
+            if response.tool_calls:
+                for tool_call in response.tool_calls:
+                    print(f"tool_call = {tool_call}")
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["args"]
 
-                final_text.append(response.content[0].text)
+                    # Log tool use
+                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
 
-        return "\n".join(final_text)
+                    # Run tool and capture result
+                    result = await self.session.call_tool(tool_name, tool_args)
+                    print(f"call tool result = {result}")
+                    tool_results.append({"call": tool_name, "result": result})
+
+                    # Append assistant's tool call + tool result to messages
+                    messages.append({
+                        "role": "assistant",
+                        "content": "",  # GPT tool call messages don't contain visible text
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": str(result.content)
+                    })
+
+                # Loop again with tool result
+                continue
+
+            # If no more tool calls, end conversation
+            print(f"response.content = {response.content}")
+            final_text.append(response.content)
+            break
+
+        return "\n".join(final_text) # weather alert for NY
+
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
